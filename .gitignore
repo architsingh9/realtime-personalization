@@ -31,6 +31,7 @@ artifacts/
 model.json
 arms.json
 
+
 # Logs
 *.log
 
@@ -41,3 +42,5 @@ arms.json
 *.env
 .envrc
 .aws/
+
+!docs/arms.json
