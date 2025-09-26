@@ -7,6 +7,7 @@ import numpy as np
 # defaults controlled via env; safe values for offline ablations
 DEFAULT_SIGMA = float(os.getenv("SIGMA", "0.05"))    # Thompson exploration scale
 DEFAULT_LAMBDA = float(os.getenv("LAMBDA", "0.01"))  # ridge prior for A init
+DISABLE_ADAPTIVE_JITTER = os.getenv("DISABLE_ADAPTIVE_JITTER", "0").lower() in ("1","true","yes")
 
 # ---------- numeric helpers ----------
 def _symmetrize(M: np.ndarray) -> np.ndarray:
@@ -60,7 +61,8 @@ class BayesianHead:
     def sample_theta(self, sigma: float = DEFAULT_SIGMA, eps: float = 1e-8) -> np.ndarray:
         # posterior covariance: sigma^2 * A_inv
         cov = (sigma ** 2) * self.A_inv.astype(np.float64)
-        L = _chol_with_dynamic_jitter(cov, base_eps=eps)
+        L = (np.linalg.cholesky(_symmetrize(cov) + 1e-8*np.eye(self.d))
+     if DISABLE_ADAPTIVE_JITTER else _chol_with_dynamic_jitter(cov, base_eps=eps))
         z = np.random.normal(size=(self.d,)).astype(np.float64)
         return (self.theta.astype(np.float64) + L @ z).astype(np.float32)
 

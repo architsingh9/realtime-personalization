@@ -1,4 +1,4 @@
-# scripts/offline_bandit.py
+# scripts/offline_linucb.py
 import json, random, csv, time
 from pathlib import Path
 import numpy as np
@@ -6,32 +6,28 @@ import numpy as np
 from realtime_personalization.emb_store import load_embs
 from realtime_personalization.feature_joiner import make_rep
 from realtime_personalization.mlp import TinyMLP
-from realtime_personalization.neurallinear import NeuralLinearModel
 
 ART = Path("artifacts")
 DOCS = Path("docs")
 DATA = Path("data/processed")
 
-EVENTS     = DATA / "events_base.parquet"
-ARMS_FILE  = DOCS / "arms.json"
-MLP_PATH   = ART / "mlp_weights.npz"
-HEADS_PATH = ART / "bandit_heads.json"
-USER_EMB   = ART / "user_emb.parquet"
-ITEM_EMB   = ART / "item_emb.parquet"
+EVENTS    = DATA / "events_base.parquet"
+ARMS_FILE = DOCS / "arms.json"
+MLP_PATH  = ART / "mlp_weights.npz"
 
-RUN_LOG = ART / "offline_ctr_run.csv"
-SEED = 42  # reproducibility for offline replay
+RUN_LOG = ART / "offline_ctr_linucb.csv"
+
+SEED = 42
+LAMBDA = float(json.loads(json.dumps({"v": 0.01}))["v"])  # ridge; keeps pure stdlib
+ALPHA  = float(json.loads(json.dumps({"v": 0.20}))["v"])  # UCB exploration scale
 
 
 def _read_events_arrow_no_pandas(path: Path):
     """
     Arrow-only reader for events_base.parquet.
-    Returns dict of numpy arrays (all length n):
-      user_id (object/str), item_id (object/str), page (object/str),
-      device (object/str), rating (float32)
+    Returns dict of numpy arrays (length n): user_id, item_id, page, device, rating
     """
     import pyarrow.parquet as pq
-
     tbl = pq.read_table(str(path))
     n = tbl.num_rows
 
@@ -59,9 +55,8 @@ def _read_events_arrow_no_pandas(path: Path):
     device  = get_str_col("device", "")
     rating  = get_float_col("rating", 4.0)
 
-    # deterministic shuffle using a permutation (to avoid pandas.sample)
     rng = np.random.default_rng(SEED)
-    perm = rng.permutation(len(user_id))
+    perm = rng.permutation(n)
 
     def take(a): return a[perm]
 
@@ -71,7 +66,7 @@ def _read_events_arrow_no_pandas(path: Path):
         "page":    take(page),
         "device":  take(device),
         "rating":  take(rating),
-        "n":       len(user_id),
+        "n":       n,
     }
 
 
@@ -81,7 +76,6 @@ def load_arms():
 
 
 def reward_from_event(chosen_item: str, row_item_id: str, row_rating: float) -> int:
-    """Click simulator used for offline replay."""
     base = 0.05
     if chosen_item == row_item_id:
         rating = float(row_rating if row_rating is not None else 4.0)
@@ -92,39 +86,44 @@ def reward_from_event(chosen_item: str, row_item_id: str, row_rating: float) -> 
 
 
 def main():
-    # Reproducibility
     random.seed(SEED)
     np.random.seed(SEED)
 
-    # Sanity checks for artifacts
-    for pth, msg in [
-        (EVENTS,     "Run scripts/preprocess.py first to produce events_base.parquet."),
-        (ARMS_FILE,  "Run scripts/select_arms.py to produce docs/arms.json."),
-        (USER_EMB,   "Run scripts/train_embeddings.py to produce user/item embeddings."),
-        (ITEM_EMB,   "Run scripts/train_embeddings.py to produce user/item embeddings."),
-        (MLP_PATH,   "Run scripts/train_mlp.py to warm-start the MLP (mlp_weights.npz)."),
-        (HEADS_PATH, "Run scripts/init_mlp_and_heads.py to init bandit heads."),
+    # Artifact checks
+    for pth, hint in [
+        (EVENTS, "Run scripts/preprocess.py first."),
+        (ARMS_FILE, "Run scripts/select_arms.py to produce docs/arms.json."),
+        (ART / "user_emb.parquet", "Run scripts/train_embeddings.py first."),
+        (ART / "item_emb.parquet", "Run scripts/train_embeddings.py first."),
+        (MLP_PATH, "Run scripts/train_mlp.py to warm-start the MLP."),
     ]:
         if not Path(pth).exists():
-            raise SystemExit(f"Missing required artifact: {pth}\nHint: {msg}")
+            raise SystemExit(f"Missing required artifact: {pth}\nHint: {hint}")
 
-    # Load artifacts
     arms = load_arms()
-    U, V, emb_dim = load_embs(str(USER_EMB), str(ITEM_EMB))
-    mlp = TinyMLP.load(str(MLP_PATH))
-    model = NeuralLinearModel.load_json(str(HEADS_PATH))
+    U, V, emb_dim = load_embs(str(ART / "user_emb.parquet"), str(ART / "item_emb.parquet"))
+    mlp = TinyMLP.load(str(MLP_PATH))  # we still use the same representation
+    
+    # LinUCB per-arm parameters over the hidden rep + bias (65-dim)
+    HIDDEN = 64
+    D = HIDDEN + 1  # +1 bias
+    A = {a: (LAMBDA * np.eye(D, dtype=np.float32)) for a in arms}   # dxd
+    A_inv = {a: np.linalg.inv(A[a]) for a in arms}                  # dxd
+    b = {a: np.zeros(D, dtype=np.float32) for a in arms}            # d
 
-    # Read events without pandas
+    def rep(uid, page, device, item):
+        feats = store.get(uid, {"visitCount": 0, "lastPage": "", "lastDevice": ""})
+        z = np.array(make_rep(feats, {"page": page, "device": device}, uid, item, U, V, emb_dim), dtype=np.float32)
+        h = mlp.forward(z)  # (64,)
+        return np.concatenate([h, np.array([1.0], dtype=np.float32)], axis=0)  # (65,)
+
     ev = _read_events_arrow_no_pandas(EVENTS)
     n = ev["n"]
-
-    # Lightweight per-user store to evolve wide features (visitCount/lastPage/lastDevice)
-    user_feats = {}
+    store = {}
 
     clicks = 0
     imps = 0
-    hist = []  # (impressions, clicks, ctr)
-
+    hist = []
     RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
 
     for i in range(n):
@@ -134,34 +133,37 @@ def main():
         itemid = ev["item_id"][i]
         rating = float(ev["rating"][i])
 
-        feats = user_feats.get(uid, {"visitCount": 0, "lastPage": "", "lastDevice": ""})
-
-        # Build per-arm hidden reps (append bias = 1.0 so d=65 matches heads)
-        h_by_arm = {}
+        # UCB selection
+        x_by_arm = {}
+        scores = []
         for a in arms:
-            z = np.array(
-                make_rep(feats, {"page": page, "device": device}, uid, a, U, V, emb_dim),
-                dtype=np.float32,
-            )
-            h = mlp.forward(z)  # (64,)
-            if h.shape[0] == 64:
-                h = np.concatenate([h, np.array([1.0], dtype=np.float32)], axis=0)  # -> (65,)
-            h_by_arm[a] = h
+            x = rep(uid, page, device, a)           # (65,)
+            Ainv = A_inv[a]
+            theta = Ainv @ b[a]                     # (65,)
+            mean = float(theta @ x)
+            var  = float(np.sqrt(np.maximum(1e-12, x @ (Ainv @ x))))
+            ucb  = mean + ALPHA * var
+            x_by_arm[a] = x
+            scores.append((ucb, a))
+        chosen = max(scores, key=lambda t: t[0])[1]
 
-        # Choose arm via Thompson sampling over heads
-        chosen = model.choose_thompson(h_by_arm)
-
-        # Simulate feedback and update
+        # reward + update
         r = reward_from_event(chosen, itemid, rating)
         clicks += r
         imps += 1
-        model.update(chosen, h_by_arm[chosen], r)
 
-        # Evolve user features as if maintained by an online feature store
+        x = x_by_arm[chosen]
+        A[chosen] += np.outer(x, x)
+        b[chosen] += r * x
+        # keep inverse in sync (recompute; D=65, cheap)
+        A_inv[chosen] = np.linalg.inv(A[chosen])
+
+        # evolve user features
+        feats = store.get(uid, {"visitCount": 0, "lastPage": "", "lastDevice": ""})
         feats["visitCount"] = feats.get("visitCount", 0) + 1
         feats["lastPage"] = page
         feats["lastDevice"] = device
-        user_feats[uid] = feats
+        store[uid] = feats
 
         if imps % 1000 == 0:
             ctr = clicks / imps
@@ -170,10 +172,6 @@ def main():
 
     final_ctr = clicks / imps if imps else 0.0
     print(f"Final CTR={final_ctr:.3f}  (clicks={clicks}, imps={imps})")
-
-    # Persist updated heads and the CTR curve
-    model.save_json(str(HEADS_PATH))
-    print(f"Saved updated heads to {HEADS_PATH}")
 
     with open(RUN_LOG, "w", newline="") as f:
         w = csv.writer(f)
